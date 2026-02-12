@@ -1,0 +1,1041 @@
+#!/usr/bin/env pwsh
+
+# SCRIPT DE CONFIGURACION DE SERVIDOR DHCP EN WINDOWS SERVER 2022
+
+# Verificar administrador
+if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    Write-Host "ERROR: Ejecutar como administrador"
+    exit 1
+}
+
+# VARIABLES GLOBALES
+$SUBRED = ""
+$MASCARA = ""
+$GATEWAY = $null
+$DNS_SERVER = $null
+$INTERFAZ_DHCP = ""
+$NOMBRE_SCOPE = "Red_Sistemas_DHCP"
+$TIEMPO_CONCESION = 7200
+$MAX_TIEMPO = 14400
+$IP_SERVIDOR = ""
+$IP_RANGO_INICIO = ""
+$IP_RANGO_FIN = ""
+$BROADCAST = ""
+
+# FUNCIONES DE CONVERSION
+function IP-ToUInt32 {
+    param([string]$ip)
+    $octets = $ip -split '\.'
+    return [uint32](([uint32]$octets[0] -shl 24) -bor 
+                    ([uint32]$octets[1] -shl 16) -bor 
+                    ([uint32]$octets[2] -shl 8) -bor 
+                    [uint32]$octets[3])
+}
+
+function UInt32-ToIP {
+    param([uint32]$num)
+    return "$(($num -shr 24) -band 255).$(($num -shr 16) -band 255).$(($num -shr 8) -band 255).$($num -band 255)"
+}
+
+# FUNCIONES DE VALIDACION (BASADAS EN BASH)
+function Validar-IP {
+    param([string]$ip)
+    
+    if ([string]::IsNullOrEmpty($ip)) {
+        Write-Host "ERROR: IP no puede estar vacia"
+        return $false
+    }
+    
+    $ipPattern = '^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+    if ($ip -notmatch $ipPattern) {
+        Write-Host "ERROR: Formato de IP invalido: $ip"
+        return $false
+    }
+    
+    $octets = $ip -split '\.'
+    foreach ($octet in $octets) {
+        $num = [int]$octet
+        if ($num -lt 0 -or $num -gt 255) {
+            Write-Host "ERROR: Octeto fuera de rango (0-255): $octet"
+            return $false
+        }
+    }
+    
+    # IPs prohibidas (igual que en Bash)
+    if ($ip -eq "0.0.0.0") {
+        Write-Host "ERROR: IP PROHIBIDA: $ip (0.0.0.0 no se puede usar)"
+        return $false
+    }
+    
+    if ($octets[0] -eq 127 -and $octets[1] -eq 0 -and $octets[2] -eq 0 -and [int]$octets[3] -ge 0 -and [int]$octets[3] -le 2) {
+        Write-Host "ERROR: IP PROHIBIDA: $ip (Rango de loopback 127.0.0.0-127.0.0.2)"
+        return $false
+    }
+    
+    if ($ip -eq "255.255.255.255") {
+        Write-Host "ERROR: IP PROHIBIDA: $ip (Broadcast global)"
+        return $false
+    }
+    
+    # Advertencias (no errores)
+    if ($octets[3] -eq 0) {
+        Write-Host "ADVERTENCIA: $ip es una direccion de red"
+    }
+    
+    if ($octets[3] -eq 255) {
+        Write-Host "ADVERTENCIA: $ip es una direccion de broadcast"
+    }
+    
+    return $true
+}
+
+function Validar-IP-Servidor {
+    param([string]$ip)
+    
+    if (-not (Validar-IP $ip)) {
+        return $false
+    }
+    
+    $octets = $ip -split '\.'
+    if ($octets[3] -eq 0) {
+        Write-Host "ERROR: La IP del servidor no puede ser la direccion de red: $ip"
+        return $false
+    }
+    
+    if ($octets[3] -eq 255) {
+        Write-Host "ERROR: La IP del servidor no puede ser la direccion de broadcast: $ip"
+        return $false
+    }
+    
+    return $true
+}
+
+function Validar-Mascara {
+    param([string]$mascara)
+    
+    if (-not (Validar-IP $mascara)) {
+        return $false
+    }
+    
+    $mascaraNum = IP-ToUInt32 $mascara
+    
+    # Verificar que la mascara sea contigua (todos 1's seguidos de 0's)
+    $mascaraBin = [convert]::ToString($mascaraNum, 2).PadLeft(32, '0')
+    
+    if ($mascaraBin -notmatch '^1+0+$') {
+        Write-Host "ERROR: Mascara de subred no valida (debe ser contigua): $mascara"
+        return $false
+    }
+    
+    return $true
+}
+
+function Validar-RangoIP {
+    param([string]$inicio, [string]$fin, [string]$subred, [string]$mascara)
+    
+    if ([string]::IsNullOrEmpty($inicio) -or [string]::IsNullOrEmpty($fin)) {
+        Write-Host "ERROR: IP de inicio o fin no especificada"
+        return $false
+    }
+    
+    $inicioNum = IP-ToUInt32 $inicio
+    $finNum = IP-ToUInt32 $fin
+    $subredNum = IP-ToUInt32 $subred
+    $mascaraNum = IP-ToUInt32 $mascara
+    
+    # Calcular broadcast: subred + (NOT mascara)
+    $wildcard = (-bnot $mascaraNum) -band 0xFFFFFFFF
+    $broadcastNum = $subredNum + $wildcard
+    
+    if ($finNum -lt $inicioNum) {
+        Write-Host "ERROR: La IP final ($fin) es menor que la IP inicial ($inicio)"
+        return $false
+    }
+    
+    # Validar que esten dentro de la subred (usando uint32 para evitar numeros negativos)
+    if ($inicioNum -lt $subredNum) {
+        Write-Host "ERROR: IP inicial fuera del rango de subred"
+        return $false
+    }
+    
+    if ($finNum -gt $broadcastNum) {
+        Write-Host "ERROR: IP final fuera del rango de subred"
+        Write-Host "DEBUG: Subred: $subred ($subredNum)"
+        Write-Host "DEBUG: Broadcast: $(UInt32-ToIP $broadcastNum) ($broadcastNum)"
+        Write-Host "DEBUG: Rango: $inicio ($inicioNum) - $fin ($finNum)"
+        return $false
+    }
+    
+    return $true
+}
+
+function Validar-Segundos {
+    param([string]$segundos)
+    
+    if ($segundos -notmatch '^\d+$') {
+        Write-Host "ERROR: Debe ser un numero entero"
+        return $false
+    }
+    
+    $num = [int]$segundos
+    if ($num -lt 60) {
+        Write-Host "ERROR: El tiempo minimo es 60 segundos"
+        return $false
+    }
+    
+    if ($num -gt 86400) {
+        $respuesta = Read-Host "ADVERTENCIA: Tiempo mayor a 24 horas. Continuar? (s/n)"
+        if ($respuesta -notmatch '^[sS]$') {
+            return $false
+        }
+    }
+    
+    return $true
+}
+
+function Calcular-DireccionRed {
+    param([string]$ip, [string]$mascara)
+    
+    $ipNum = IP-ToUInt32 $ip
+    $mascaraNum = IP-ToUInt32 $mascara
+    $redNum = $ipNum -band $mascaraNum
+    
+    return (UInt32-ToIP $redNum)
+}
+
+function Calcular-Broadcast {
+    param([string]$ip, [string]$mascara)
+    
+    $ipNum = IP-ToUInt32 $ip
+    $mascaraNum = IP-ToUInt32 $mascara
+    $redNum = $ipNum -band $mascaraNum
+    $wildcard = (-bnot $mascaraNum) -band 0xFFFFFFFF
+    $broadcastNum = $redNum + $wildcard
+    
+    return (UInt32-ToIP $broadcastNum)
+}
+
+# FUNCION: VERIFICAR INSTALACION
+function Verificar-Instalacion {
+    Write-Host ""
+    Write-Host "=== VERIFICANDO INSTALACION ==="
+    
+    $dhcpInstalled = $false
+    try {
+        $feature = Get-WindowsFeature -Name DHCP -ErrorAction SilentlyContinue
+        $dhcpInstalled = $feature.Installed
+    } catch {
+        $dhcpInstalled = $false
+    }
+    
+    if ($dhcpInstalled) {
+        Write-Host "OK DHCP Server esta instalado"
+        
+        $service = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
+        if ($service -and $service.Status -eq "Running") {
+            Write-Host "OK Servicio DHCP esta activo"
+        } else {
+            Write-Host "ERROR Servicio DHCP NO esta activo"
+        }
+        
+        # Verificar version
+        try {
+            $version = netsh dhcp server show version | Select-String "Version"
+            Write-Host $version
+        } catch {}
+        
+        return $true
+    } else {
+        Write-Host "ERROR DHCP Server NO esta instalado"
+        return $false
+    }
+}
+
+# FUNCION: INSTALAR DHCP
+function Instalar-DHCP {
+    Write-Host ""
+    Write-Host "=== INSTALANDO SERVIDOR DHCP ==="
+    
+    if (Verificar-Instalacion) {
+        Write-Host ""
+        $respuesta = Read-Host "El servidor DHCP ya esta instalado. Desea reinstalarlo? (s/n)"
+        if ($respuesta -notmatch '^[sS]$') {
+            Write-Host "Instalacion cancelada"
+            return $false
+        }
+        
+        Write-Host "Deteniendo servicio..."
+        Stop-Service -Name DHCPServer -Force -ErrorAction SilentlyContinue
+        
+        Write-Host "Desinstalando DHCP Server..."
+        try {
+            Uninstall-WindowsFeature -Name DHCP -Remove
+            Write-Host "OK DHCP Server desinstalado completamente"
+        } catch {
+            Write-Host "ERROR: No se pudo desinstalar"
+            return $false
+        }
+    }
+    
+    Write-Host "Instalando DHCP Server..."
+    try {
+        Install-WindowsFeature -Name DHCP -IncludeManagementTools
+        
+        # Configurar grupos de seguridad
+        try {
+            netsh dhcp add securitygroups | Out-Null
+            Write-Host "OK Grupos de seguridad configurados"
+        } catch {}
+        
+        Start-Sleep -Seconds 3
+        
+        Write-Host "OK DHCP Server instalado correctamente"
+        Write-Host ""
+        Write-Host "NOTA: El servicio no se iniciara automaticamente"
+        Write-Host "Debe configurar el servidor DHCP para iniciar el servicio"
+        
+        return $true
+    } catch {
+        Write-Host "ERROR: Fallo la instalacion de DHCP Server"
+        Write-Host "Detalles: $_"
+        return $false
+    }
+}
+
+# FUNCION: OBTENER INTERFACES DE RED
+function Obtener-InterfacesRed {
+    Write-Host ""
+    Write-Host "=== INTERFACES DE RED DETECTADAS ==="
+    
+    $interfaces = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Sort-Object Name
+    
+    if ($interfaces.Count -eq 0) {
+        Write-Host "ERROR: No hay interfaces de red activas"
+        return $null
+    }
+    
+    $i = 1
+    $interfacesList = @()
+    
+    foreach ($interface in $interfaces) {
+        $ipInfo = Get-NetIPAddress -InterfaceIndex $interface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $ipAddress = if ($ipInfo) { $ipInfo.IPAddress } else { "Sin IP" }
+        
+        Write-Host "$i. $($interface.Name) - IP: $ipAddress"
+        $interfacesList += $interface
+        $i++
+    }
+    
+    Write-Host ""
+    Write-Host "Interfaces disponibles:"
+    Write-Host "-----------------------"
+    $interfacesList | ForEach-Object { Write-Host "  $($_.Name)" }
+    
+    return $interfacesList
+}
+
+# FUNCION: CONFIGURAR INTERFAZ DE RED
+function Configurar-InterfazRed {
+    param([string]$interfaz, [string]$ip, [string]$mascara)
+    
+    Write-Host ""
+    Write-Host "=== CONFIGURANDO INTERFAZ DE RED ==="
+    
+    # Verificar que la interfaz existe
+    $adapter = Get-NetAdapter -Name $interfaz -ErrorAction SilentlyContinue
+    if (-not $adapter) {
+        Write-Host "ERROR: La interfaz $interfaz no existe"
+        return $false
+    }
+    
+    # Activar interfaz si esta down
+    if ($adapter.Status -ne "Up") {
+        Write-Host "Activando interfaz $interfaz..."
+        Enable-NetAdapter -Name $interfaz -Confirm:$false
+        Start-Sleep -Seconds 2
+    }
+    
+    Write-Host "Configurando ${interfaz} con IP $ip mascara $mascara..."
+    
+    try {
+        # Liberar IP actual
+        netsh interface ip set address "$interfaz" dhcp | Out-Null
+        Start-Sleep -Seconds 1
+        
+        # Asignar IP estatica
+        netsh interface ip set address "$interfaz" static $ip $mascara
+        Start-Sleep -Seconds 2
+        
+        # Verificar configuracion
+        $ipConfig = Get-NetIPAddress -InterfaceAlias $interfaz -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($ipConfig.IPAddress -eq $ip) {
+            Write-Host "OK Interfaz $interfaz configurada correctamente"
+            return $true
+        } else {
+            Write-Host "ERROR: No se pudo configurar la interfaz"
+            return $false
+        }
+    } catch {
+        Write-Host "ERROR: Fallo al configurar la interfaz"
+        Write-Host "Detalles: $_"
+        return $false
+    }
+}
+
+# FUNCION: CONFIGURAR SERVIDOR DHCP
+function Configurar-DHCP {
+    Write-Host ""
+    Write-Host "=== CONFIGURACION DE PARAMETROS DHCP ==="
+    
+    if (-not (Verificar-Instalacion)) {
+        Write-Host ""
+        Write-Host "ERROR: El servidor DHCP no esta instalado."
+        Write-Host "Por favor, instalelo primero (opcion 2)."
+        return $false
+    }
+    
+    # Seleccionar interfaz
+    $interfaces = Obtener-InterfacesRed
+    if (-not $interfaces) { return $false }
+    
+    $script:INTERFAZ_DHCP = ""
+    $seleccionValida = $false
+    
+    while (-not $seleccionValida) {
+        $inputInterfaz = Read-Host "Ingrese el nombre de la interfaz a usar"
+        
+        if ([string]::IsNullOrEmpty($inputInterfaz)) {
+            Write-Host "ERROR: Debe ingresar un nombre de interfaz"
+            continue
+        }
+        
+        $adapter = Get-NetAdapter -Name $inputInterfaz -ErrorAction SilentlyContinue
+        if ($adapter) {
+            $script:INTERFAZ_DHCP = $inputInterfaz
+            $seleccionValida = $true
+        } else {
+            Write-Host "ERROR: La interfaz $inputInterfaz no existe"
+            Write-Host "Interfaces disponibles:"
+            $interfaces | ForEach-Object { Write-Host "  $($_.Name)" }
+        }
+    }
+    
+    Write-Host "Interfaz seleccionada: $INTERFAZ_DHCP"
+    Write-Host ""
+    
+    # Solicitar nombre del ambito
+    $inputNombre = Read-Host "Nombre del ambito [$NOMBRE_SCOPE]"
+    if ($inputNombre) { $script:NOMBRE_SCOPE = $inputNombre }
+    
+    # Solicitar mascara de subred
+    while ($true) {
+        $inputMascara = Read-Host "Mascara de subred [255.255.255.0]"
+        $inputMascara = if ($inputMascara) { $inputMascara } else { "255.255.255.0" }
+        
+        if (Validar-Mascara $inputMascara) {
+            $script:MASCARA = $inputMascara
+            break
+        }
+    }
+    
+    # Solicitar IP del servidor
+    while ($true) {
+        $inputIPServer = Read-Host "IP estatica del servidor DHCP (obligatoria)"
+        if ([string]::IsNullOrEmpty($inputIPServer)) {
+            Write-Host "ERROR: La IP del servidor es obligatoria"
+            continue
+        }
+        
+        if (Validar-IP-Servidor $inputIPServer) {
+            $script:IP_SERVIDOR = $inputIPServer
+            break
+        }
+    }
+    
+    # Calcular subred y broadcast
+    $script:SUBRED = Calcular-DireccionRed $IP_SERVIDOR $MASCARA
+    $script:BROADCAST = Calcular-Broadcast $IP_SERVIDOR $MASCARA
+    
+    Write-Host "Subred calculada: $SUBRED"
+    Write-Host "Broadcast calculado: $BROADCAST"
+    
+    # Sugerir IPs de rango basadas en la IP del servidor
+    $octets = $IP_SERVIDOR -split '\.'
+    $ipRangoInicioSug = "$($octets[0]).$($octets[1]).$($octets[2]).$([int]$octets[3] + 1)"
+    $ipRangoFinSug = "$($octets[0]).$($octets[1]).$($octets[2]).150"
+    
+    if ($MASCARA -ne "255.255.255.0") {
+        $ipRangoFinSug = "$($octets[0]).$($octets[1]).$($octets[2]).$([int]$octets[3] + 50)"
+    }
+    
+    # Solicitar IP inicio del rango
+    while ($true) {
+        $inputRangoInicio = Read-Host "IP de inicio del rango DHCP [$ipRangoInicioSug]"
+        $inputRangoInicio = if ($inputRangoInicio) { $inputRangoInicio } else { $ipRangoInicioSug }
+        
+        if (Validar-IP $inputRangoInicio) {
+            if ($inputRangoInicio -eq $IP_SERVIDOR) {
+                Write-Host "ERROR: La IP de inicio no puede ser igual a la IP del servidor"
+                continue
+            }
+            $script:IP_RANGO_INICIO = $inputRangoInicio
+            break
+        }
+    }
+    
+    # Solicitar IP fin del rango
+    while ($true) {
+        $inputRangoFin = Read-Host "IP de fin del rango DHCP [$ipRangoFinSug]"
+        $inputRangoFin = if ($inputRangoFin) { $inputRangoFin } else { $ipRangoFinSug }
+        
+        if (Validar-IP $inputRangoFin) {
+            if ($inputRangoFin -eq $IP_SERVIDOR) {
+                Write-Host "ERROR: La IP de fin no puede ser igual a la IP del servidor"
+                continue
+            }
+            
+            if (Validar-RangoIP $IP_RANGO_INICIO $inputRangoFin $SUBRED $MASCARA) {
+                $script:IP_RANGO_FIN = $inputRangoFin
+                break
+            }
+        }
+    }
+    
+    # Solicitar Gateway
+    $gatewaySug = "$($octets[0]).$($octets[1]).$($octets[2]).1"
+    while ($true) {
+        $inputGateway = Read-Host "Gateway (puerta de enlace) [$gatewaySug]"
+        
+        if ([string]::IsNullOrEmpty($inputGateway)) {
+            $script:GATEWAY = $null
+            Write-Host "OK Sin gateway configurado"
+            break
+        }
+        
+        $inputGateway = if ($inputGateway) { $inputGateway } else { $gatewaySug }
+        
+        if (Validar-IP $inputGateway) {
+            $script:GATEWAY = $inputGateway
+            break
+        }
+    }
+    
+    # Solicitar DNS
+    while ($true) {
+        $inputDNS = Read-Host "Servidor DNS [8.8.8.8]"
+        
+        if ([string]::IsNullOrEmpty($inputDNS)) {
+            $script:DNS_SERVER = $null
+            Write-Host "OK Sin DNS configurado"
+            break
+        }
+        
+        $inputDNS = if ($inputDNS) { $inputDNS } else { "8.8.8.8" }
+        
+        if (Validar-IP $inputDNS) {
+            $script:DNS_SERVER = $inputDNS
+            break
+        }
+    }
+    
+    # Solicitar tiempo de concesion
+    while ($true) {
+        $inputTiempo = Read-Host "Tiempo de concesion en segundos [$TIEMPO_CONCESION]"
+        $inputTiempo = if ($inputTiempo) { $inputTiempo } else { $TIEMPO_CONCESION }
+        
+        if (Validar-Segundos $inputTiempo) {
+            $script:TIEMPO_CONCESION = [int]$inputTiempo
+            $script:MAX_TIEMPO = $script:TIEMPO_CONCESION * 2
+            break
+        }
+    }
+    
+    # RESUMEN DE CONFIGURACION
+    Write-Host ""
+    Write-Host "=== RESUMEN DE CONFIGURACION ==="
+    Write-Host "Nombre del ambito:    $NOMBRE_SCOPE"
+    Write-Host "Interfaz:             $INTERFAZ_DHCP"
+    Write-Host "IP del servidor:      $IP_SERVIDOR"
+    Write-Host "Mascara de red:       $MASCARA"
+    Write-Host "Subred:               $SUBRED"
+    Write-Host "Broadcast:            $BROADCAST"
+    Write-Host "Rango DHCP:           $IP_RANGO_INICIO - $IP_RANGO_FIN"
+    Write-Host "Gateway:              $(if($GATEWAY){$GATEWAY}else{'No configurado'})"
+    Write-Host "DNS:                  $(if($DNS_SERVER){$DNS_SERVER}else{'No configurado'})"
+    Write-Host "Tiempo concesion:     $TIEMPO_CONCESION segundos"
+    Write-Host "Tiempo maximo:        $MAX_TIEMPO segundos"
+    Write-Host ""
+    
+    $respuesta = Read-Host "Continuar con la configuracion? (s/n)"
+    if ($respuesta -notmatch '^[sS]$') {
+        Write-Host "Configuracion cancelada"
+        return $false
+    }
+    
+    # Configurar interfaz de red
+    if (-not (Configurar-InterfazRed $INTERFAZ_DHCP $IP_SERVIDOR $MASCARA)) {
+        Write-Host "ERROR: No se pudo configurar la interfaz de red"
+        return $false
+    }
+    
+    Write-Host ""
+    Write-Host "=== CONFIGURANDO SERVIDOR DHCP ==="
+    
+    try {
+        # Configurar archivo de configuracion usando netsh
+        Write-Host "Configurando servicio DHCP..."
+        
+        # Eliminar scope existente si hay conflicto
+        try {
+            $scopeExistente = netsh dhcp server show scope | Select-String $SUBRED
+            if ($scopeExistente) {
+                Write-Host "Eliminando scope existente para $SUBRED..."
+                netsh dhcp server delete scope $SUBRED yes | Out-Null
+                Start-Sleep -Seconds 2
+            }
+        } catch {
+            # Ignorar error si no existe
+        }
+        
+        # Crear scope
+        Write-Host "Creando scope para subred $SUBRED..."
+        netsh dhcp server add scope $SUBRED $MASCARA $NOMBRE_SCOPE | Out-Null
+        Start-Sleep -Seconds 1
+        
+        # Configurar rango
+        Write-Host "Configurando rango: $IP_RANGO_INICIO - $IP_RANGO_FIN..."
+        netsh dhcp server scope $SUBRED add iprange $IP_RANGO_INICIO $IP_RANGO_FIN | Out-Null
+        
+        # Excluir IP del servidor
+        Write-Host "Excluyendo IP del servidor: $IP_SERVIDOR..."
+        netsh dhcp server scope $SUBRED add excluderange $IP_SERVIDOR $IP_SERVIDOR | Out-Null
+        
+        # Configurar gateway
+        if ($GATEWAY) {
+            Write-Host "Configurando gateway: $GATEWAY..."
+            netsh dhcp server scope $SUBRED set optionvalue 003 ipaddress $GATEWAY | Out-Null
+        }
+        
+        # Configurar DNS
+        if ($DNS_SERVER) {
+            Write-Host "Configurando DNS: $DNS_SERVER..."
+            netsh dhcp server scope $SUBRED set optionvalue 006 ipaddress $DNS_SERVER | Out-Null
+        }
+        
+        # Configurar tiempo de concesion
+        Write-Host "Configurando tiempo de concesion..."
+        $dias = [math]::Floor($TIEMPO_CONCESION / 86400)
+        $horas = [math]::Floor(($TIEMPO_CONCESION % 86400) / 3600)
+        $minutos = [math]::Floor(($TIEMPO_CONCESION % 3600) / 60)
+        netsh dhcp server scope $SUBRED set lease $dias $horas $minutos | Out-Null
+        
+        # Activar scope
+        Write-Host "Activando scope..."
+        netsh dhcp server scope $SUBRED set state 1 | Out-Null
+        
+        # Configurar binding de interfaz
+        Write-Host "Configurando binding de interfaz..."
+        try {
+            netsh dhcp server add interface $INTERFAZ_DHCP | Out-Null
+        } catch {
+            Write-Host "ADVERTENCIA: No se pudo agregar binding"
+            netsh dhcp add server $env:COMPUTERNAME $IP_SERVIDOR | Out-Null
+        }
+        
+        # Autorizar servidor en AD
+        try {
+            Write-Host "Autorizando servidor DHCP..."
+            netsh dhcp add server $env:COMPUTERNAME $IP_SERVIDOR | Out-Null
+        } catch {
+            Write-Host "ADVERTENCIA: No se pudo autorizar servidor (entorno sin AD)"
+        }
+        
+        # Configurar firewall
+        Write-Host "Configurando firewall para DHCP..."
+        try {
+            netsh advfirewall firewall set rule group="Servidor DHCP" new enable=Yes | Out-Null
+            netsh advfirewall firewall set rule group="DHCP Server" new enable=Yes | Out-Null
+            Write-Host "OK Reglas de firewall configuradas"
+        } catch {
+            Write-Host "ADVERTENCIA: No se pudo configurar firewall automaticamente"
+        }
+        
+        # Iniciar servicio
+        Write-Host ""
+        Write-Host "=== INICIANDO SERVICIO DHCP ==="
+        
+        Stop-Service -Name DHCPServer -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        
+        Write-Host "Iniciando servicio DHCP..."
+        Start-Service -Name DHCPServer -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        
+        # Verificar servicio
+        $service = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
+        if ($service.Status -eq "Running") {
+            Write-Host "OK Servicio DHCP iniciado correctamente"
+            
+            # Configurar inicio automatico
+            Set-Service -Name DHCPServer -StartupType Automatic
+            Write-Host "OK Servicio configurado para inicio automatico"
+        } else {
+            Write-Host "ADVERTENCIA: No se pudo iniciar el servicio"
+            Write-Host "Intente iniciarlo manualmente: Start-Service DHCPServer"
+        }
+        
+        Write-Host ""
+        Write-Host "========================================="
+        Write-Host "OK CONFIGURACION COMPLETADA EXITOSAMENTE"
+        Write-Host "========================================="
+        Write-Host ""
+        Write-Host "SUBRED CONFIGURADA: $SUBRED / $MASCARA"
+        Write-Host "RANGO DHCP: $IP_RANGO_INICIO - $IP_RANGO_FIN"
+        Write-Host ""
+        Write-Host "VERIFICACION DESDE EL SERVIDOR:"
+        Write-Host "  netsh dhcp server scope ${SUBRED} show clients"
+        Write-Host ""
+        Write-Host "VERIFICACION DESDE EL CLIENTE:"
+        Write-Host "  ipconfig /release"
+        Write-Host "  ipconfig /renew"
+        Write-Host "  ipconfig /all"
+        
+        return $true
+    } catch {
+        Write-Host "ERROR: Fallo la configuracion DHCP"
+        Write-Host "Detalles: $_"
+        return $false
+    }
+}
+
+# FUNCION: MONITOREAR ESTADO
+function Monitorear-Estado {
+    Write-Host ""
+    Write-Host "=== MONITOREO DEL SERVICIO DHCP ==="
+    Write-Host ""
+    
+    Write-Host "1. ESTADO DEL SERVICIO:"
+    $service = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
+    if ($service) {
+        Write-Host "   Estado: $($service.Status)"
+        Write-Host "   Tipo de inicio: $($service.StartType)"
+        
+        if ($service.Status -eq "Running") {
+            Write-Host "   OK Servicio DHCP activo"
+        } else {
+            Write-Host "   ERROR Servicio DHCP NO activo"
+        }
+    } else {
+        Write-Host "   ERROR Servicio DHCP no instalado"
+    }
+    
+    Write-Host ""
+    Write-Host "2. PUERTOS ESCUCHANDO:"
+    try {
+        $dhcpPort = netstat -an | Select-String ":67.*LISTENING"
+        if ($dhcpPort) {
+            Write-Host "   OK Puerto 67 (DHCP) escuchando"
+        } else {
+            Write-Host "   ERROR Puerto 67 NO escuchando"
+        }
+    } catch {
+        Write-Host "   No se pudo verificar puertos"
+    }
+    
+    Write-Host ""
+    Write-Host "3. SCOPES CONFIGURADOS:"
+    try {
+        $scopes = netsh dhcp server show scope
+        if ($scopes -match "Scope") {
+            Write-Host $scopes
+        } else {
+            Write-Host "   No hay scopes configurados"
+        }
+    } catch {
+        Write-Host "   No se pudo obtener informacion de scopes"
+    }
+    
+    if ($SUBRED) {
+        Write-Host ""
+        Write-Host "4. CONCESIONES ACTIVAS:"
+        try {
+            $leases = netsh dhcp server scope $SUBRED show clients 1
+            if ($leases -and $leases -notmatch "No clients") {
+                Write-Host $leases
+            } else {
+                Write-Host "   No hay concesiones activas"
+            }
+        } catch {
+            Write-Host "   No se pudieron obtener concesiones"
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "5. ESTADISTICAS DHCP:"
+    try {
+        $stats = netsh dhcp server show mibinfo
+        $stats | Select-String "Discovers|Offers|Requests|Acks|Naks|Declines|Releases" | ForEach-Object {
+            Write-Host "   $_"
+        }
+    } catch {
+        Write-Host "   No se pudieron obtener estadisticas"
+    }
+    
+    Write-Host ""
+    Write-Host "6. CONFIGURACION DE INTERFAZ ${INTERFAZ_DHCP}:"
+    $adapter = Get-NetAdapter -Name $INTERFAZ_DHCP -ErrorAction SilentlyContinue
+    if ($adapter) {
+        $ipInfo = Get-NetIPAddress -InterfaceAlias $INTERFAZ_DHCP -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($ipInfo) {
+            Write-Host "   IP: $($ipInfo.IPAddress)"
+            Write-Host "   Mascara: /$($ipInfo.PrefixLength)"
+        } else {
+            Write-Host "   No hay IP configurada en IPv4"
+        }
+    } else {
+        Write-Host "   ERROR Interfaz $INTERFAZ_DHCP no encontrada"
+    }
+    
+    Write-Host ""
+    Read-Host "Presione Enter para continuar..."
+}
+
+# FUNCION: MOSTRAR CONFIGURACION
+function Mostrar-Configuracion {
+    Write-Host ""
+    Write-Host "=== CONFIGURACION ACTUAL ==="
+    Write-Host ""
+    
+    try {
+        $config = netsh dhcp server show scope
+        Write-Host "Scopes configurados:"
+        Write-Host "---------------------"
+        Write-Host $config
+        Write-Host ""
+        
+        if ($SUBRED) {
+            Write-Host "Opciones de scope para ${SUBRED}:"
+            Write-Host "-------------------------------"
+            $options = netsh dhcp server scope $SUBRED show optionvalue
+            Write-Host $options
+        }
+    } catch {
+        Write-Host "No se pudo obtener la configuracion DHCP"
+    }
+    
+    Write-Host ""
+    Read-Host "Presione Enter para continuar..."
+}
+
+# FUNCION: CONFIGURAR FIREWALL
+function Configurar-Firewall {
+    Write-Host ""
+    Write-Host "=== CONFIGURANDO FIREWALL ==="
+    
+    try {
+        netsh advfirewall firewall set rule group="Servidor DHCP" new enable=Yes | Out-Null
+        netsh advfirewall firewall set rule group="DHCP Server" new enable=Yes | Out-Null
+        Write-Host "OK Reglas de firewall habilitadas para DHCP"
+        
+        Write-Host ""
+        Write-Host "Reglas activas:"
+        Write-Host "---------------"
+        netsh advfirewall firewall show rule name="DHCP*" | Select-String "Rule Name|Enabled" | ForEach-Object {
+            Write-Host $_ 
+        }
+    } catch {
+        Write-Host "ERROR: No se pudo configurar firewall"
+        Write-Host ""
+        Write-Host "Intente manualmente:"
+        Write-Host "  netsh advfirewall firewall set rule group='Servidor DHCP' new enable=Yes"
+    }
+    
+    Write-Host ""
+    Read-Host "Presione Enter para continuar..."
+}
+
+# FUNCION: REINSTALAR DHCP
+function Reinstalar-DHCP {
+    Write-Host ""
+    Write-Host "=== REINSTALAR SERVIDOR DHCP ==="
+    
+    if (Verificar-Instalacion) {
+        Write-Host ""
+        $respuesta = Read-Host "Desea desinstalarlo completamente antes de reinstalar? (s/n)"
+        
+        if ($respuesta -match '^[sS]$') {
+            Write-Host "Deteniendo servicio..."
+            Stop-Service -Name DHCPServer -Force -ErrorAction SilentlyContinue
+            
+            Write-Host "Desinstalando DHCP Server..."
+            try {
+                Uninstall-WindowsFeature -Name DHCP -Remove
+                Write-Host "OK Servidor DHCP desinstalado completamente"
+            } catch {
+                Write-Host "ERROR: No se pudo desinstalar"
+            }
+        }
+    }
+    
+    if (Instalar-DHCP) {
+        Write-Host ""
+        $respuesta = Read-Host "Desea configurar el servidor DHCP ahora? (s/n)"
+        if ($respuesta -match '^[sS]$') {
+            Configurar-DHCP
+        }
+    }
+}
+
+# FUNCION: DIAGNOSTICAR RED
+function Diagnosticar-Red {
+    Write-Host ""
+    Write-Host "=== DIAGNOSTICO DE RED ==="
+    Write-Host ""
+    
+    Write-Host "1. Verificando conectividad..."
+    try {
+        $ping = Test-Connection -ComputerName 8.8.8.8 -Count 2 -Quiet
+        if ($ping) {
+            Write-Host "   OK Conectividad a Internet: Activa"
+        } else {
+            Write-Host "   Fallo Conectividad a Internet: No responde"
+        }
+    } catch {
+        Write-Host "   No se pudo verificar conectividad"
+    }
+    
+    Write-Host ""
+    Write-Host "2. Configuracion IP actual:"
+    Write-Host "---------------------------"
+    Get-NetIPAddress -AddressFamily IPv4 | 
+        Where-Object {$_.InterfaceAlias -notlike "*Loopback*"} | 
+        Select-Object InterfaceAlias, IPAddress, @{Name="Mascara"; Expression={"/$($_.PrefixLength)"}} |
+        Format-Table -AutoSize
+    
+    Write-Host ""
+    Write-Host "3. Servicio DHCP:"
+    Write-Host "-----------------"
+    $service = Get-Service -Name DHCPServer -ErrorAction SilentlyContinue
+    if ($service) {
+        Write-Host "   Estado: $($service.Status)"
+        Write-Host "   Inicio: $($service.StartType)"
+    } else {
+        Write-Host "   Servicio no instalado"
+    }
+    
+    Write-Host ""
+    Read-Host "Presione Enter para continuar..."
+}
+
+# FUNCION: VERIFICAR DEPENDENCIAS
+function Verificar-Dependencias {
+    Write-Host ""
+    Write-Host "=== VERIFICANDO DEPENDENCIAS ==="
+    
+    $depsOk = $true
+    $comandos = @("netsh", "Get-WindowsFeature", "Get-Service", "Get-NetAdapter")
+    
+    foreach ($cmd in $comandos) {
+        if (Get-Command $cmd -ErrorAction SilentlyContinue) {
+            Write-Host "OK $cmd disponible"
+        } else {
+            Write-Host "ERROR $cmd no disponible"
+            $depsOk = $false
+        }
+    }
+    
+    if ($depsOk) {
+        Write-Host "OK Todas las dependencias basicas estan disponibles"
+        return $true
+    } else {
+        Write-Host "ADVERTENCIA: Faltan comandos basicos"
+        return $false
+    }
+}
+
+# FUNCION: LIMPIAR CARACTERES (UTILITARIA)
+function Limpiar-Caracteres {
+    param([string]$archivo)
+    
+    if (Test-Path $archivo) {
+        $contenido = Get-Content $archivo -Raw
+        $contenidoLimpio = $contenido -replace "`r", ""
+        $contenidoLimpio | Out-File -FilePath $archivo -Encoding ascii -NoNewline
+        Write-Host "OK Archivo $archivo limpiado de caracteres Windows"
+    } else {
+        Write-Host "ERROR: Archivo no encontrado"
+    }
+}
+
+# MENU PRINCIPAL
+function Main {
+    Clear-Host
+    Write-Host "=========================================="
+    Write-Host "  CONFIGURACION DE SERVIDOR DHCP"
+    Write-Host "  Windows Server 2022"
+    Write-Host "=========================================="
+    Write-Host "Sistema detectado: $((Get-WmiObject Win32_OperatingSystem).Caption)"
+    Write-Host "Servidor: $env:COMPUTERNAME"
+    Write-Host ""
+    Read-Host "Presione Enter para continuar..."
+    
+    # Verificar dependencias al inicio
+    Verificar-Dependencias
+    
+    while ($true) {
+        Clear-Host
+        Write-Host "=========================================="
+        Write-Host "  MENU DHCP"
+        Write-Host "=========================================="
+        Write-Host ""
+        Write-Host "1. Verificar instalacion del servidor DHCP"
+        Write-Host "2. Instalar servidor DHCP"
+        Write-Host "3. Configurar servidor DHCP"
+        Write-Host "4. Monitorear estado del servicio"
+        Write-Host "5. Mostrar configuracion actual"
+        Write-Host "6. Configurar Firewall (DHCP)"
+        Write-Host "7. Diagnosticar red"
+        Write-Host "8. Reinstalar servidor DHCP"
+        Write-Host "9. Salir"
+        Write-Host ""
+        
+        $opcion = Read-Host "Seleccione una opcion [1-9]"
+        
+        switch ($opcion) {
+            "1" { 
+                Verificar-Instalacion
+                Read-Host "`nPresione Enter para continuar..."
+            }
+            "2" { 
+                Instalar-DHCP
+                Read-Host "`nPresione Enter para continuar..."
+            }
+            "3" { 
+                Configurar-DHCP
+                Read-Host "`nPresione Enter para continuar..."
+            }
+            "4" { Monitorear-Estado }
+            "5" { Mostrar-Configuracion }
+            "6" { Configurar-Firewall }
+            "7" { Diagnosticar-Red }
+            "8" { 
+                Reinstalar-DHCP
+                Read-Host "`nPresione Enter para continuar..."
+            }
+            "9" { 
+                Write-Host ""
+                Write-Host "Saliendo del script..."
+                Write-Host ""
+                exit 0
+            }
+            default { 
+                Write-Host ""
+                Write-Host "Opcion invalida. Por favor, seleccione 1-9."
+                Start-Sleep -Seconds 2
+            }
+        }
+    }
+}
+
+# EJECUTAR PROGRAMA PRINCIPAL
+Main
